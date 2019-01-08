@@ -8,9 +8,11 @@
 #include "base/RWSpinLock.h"  //
 #include "base/wheel_timer.h"
 
+#include "util/asio/reconnectable_socket.h"
 #include "util/asio/fiber_socket.h"
 #include "util/asio/periodic_task.h"
 
+#include "util/rpc/buffered_read_adaptor.h"
 #include "util/rpc/frame_format.h"
 #include "util/rpc/rpc_envelope.h"
 
@@ -30,11 +32,11 @@ class Channel {
   // if bool(error_code) returns true, aborts receiving the stream and returns the error.
   using MessageCallback = std::function<error_code(Envelope&)>;
 
-  Channel(FiberSyncSocket* socket) : socket_(socket) {
+  Channel(ReconnectableSocket&& channel) : channel_(std::move(channel)), br_(channel_.socket(), 2048) {
   }
 
   Channel(const std::string& hostname, const std::string& service, IoContext* cntx)
-      : Channel(new FiberSyncSocket(hostname, service, cntx)) {
+      : Channel(ReconnectableSocket(hostname, service, cntx)) {
   }
 
   ~Channel();
@@ -114,8 +116,8 @@ class Channel {
   };
 
   RpcId next_send_rpc_id_ = 1;
-  std::unique_ptr<FiberSyncSocket> socket_;
-
+  ReconnectableSocket channel_;
+  BufferedReadAdaptor<ReconnectableSocket::socket_t> br_;
   typedef boost::fibers::promise<error_code> EcPromise;
 
   struct PendingCall {

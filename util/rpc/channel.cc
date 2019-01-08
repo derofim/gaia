@@ -55,7 +55,7 @@ void Channel::Shutdown() {
 
 auto Channel::Connect(uint32_t ms) -> error_code {
   CHECK(!read_fiber_.joinable());
-  error_code ec = socket_->ClientWaitToConnect(ms);
+  error_code ec = channel_.Connect(ms);
 
   IoContext& context = socket_->context();
   context.Await([this] {
@@ -74,7 +74,7 @@ auto Channel::Connect(uint32_t ms) -> error_code {
 }
 
 auto Channel::PresendChecks() -> error_code {
-  if (!socket_->is_open()) {
+  if (channel_.is_shut_down()) {
     return asio::error::shut_down;
   }
 
@@ -168,35 +168,38 @@ void Channel::ReadFiber() {
   VLOG(1) << "Start ReadFiber on socket " << socket_->native_handle();
   this_fiber::properties<IoFiberProperties>().SetNiceLevel(1);
 
-  while (socket_->is_open()) {
-    error_code ec = ReadEnvelope();
+  error_code ec = channel_.WaitForReadAvailable();
+  while (!channel_.is_shut_down()) {
     if (ec) {
       LOG_IF(WARNING, !IsExpectedFinish(ec))
           << "Error reading envelope " << ec << " " << ec.message();
 
       CancelPendingCalls(ec);
-      // Required for few reasons:
-      // 1. To preempt the fiber, otherwise it has busy loop in case socket returns the error
-      //    preventing other fibers to run.
-      // 2. To throttle cpu.
-      this_fiber::sleep_for(10ms);
+      ec.clear();
       continue;
     }
+
+    if (auto ch_st = channel_.status()) {
+      ec = channel_.WaitForReadAvailable();
+      VLOG(1) << "Channel status " << ch_st << " Read available st: " << ec;
+      continue;
+    }
+    ec = channel_.Apply([this] { return this->ReadEnvelope(); });
   }
-  CancelPendingCalls(error_code{});
-  VLOG(1) << "Finish ReadFiber on socket " << socket_->native_handle();
+  CancelPendingCalls(ec);
+  VLOG(1) << "Finish ReadFiber on socket " << channel_.handle();
 }
 
 
 // TODO: To attach Flusher io context thread, similarly to server side.
 void Channel::FlushFiber() {
   using namespace std::chrono_literals;
-  CHECK(socket_->context().get_executor().running_in_this_thread());
+  CHECK(channel_.context().get_executor().running_in_this_thread());
   this_fiber::properties<IoFiberProperties>().SetNiceLevel(4);
 
   while (true) {
     this_fiber::sleep_for(300us);
-    if (!socket_->is_open())
+    if (channel_.is_shut_down())
       break;
 
     if (outgoing_buf_size_.load(std::memory_order_acquire) == 0 || !send_mu_.try_lock())
@@ -270,7 +273,7 @@ auto Channel::FlushSendsGuarded() -> error_code {
   // Interrupt point during which outgoing_buf_ could grow.
   // We do not lock because this function is the only one that writes into channel and it's
   // guarded by send_mu_.
-  asio::write(*socket_, write_seq_, ec);
+  ec = channel_.Write(write_seq_);
   if (ec) {
     // I do not know if we need to flush everything but I prefer doing it to make it simpler.
     CancelPendingCalls(ec);
@@ -309,11 +312,11 @@ void Channel::CancelSentBufferGuarded(error_code ec) {
 
 auto Channel::ReadEnvelope() -> error_code {
   Frame f;
-  error_code ec = f.Read(socket_.get());
+  error_code ec = f.Read(&br_);
   if (ec)
     return ec;
 
-  VLOG(2) << "Got rpc_id " << f.rpc_id << " from socket " << socket_->native_handle();
+  VLOG(2) << "Got rpc_id " << f.rpc_id << " from socket " << channel_.handle();
 
   auto it = pending_calls_.find(f.rpc_id);
   if (it == pending_calls_.end()) {
@@ -324,7 +327,7 @@ auto Channel::ReadEnvelope() -> error_code {
     Envelope envelope(f.header_size, f.letter_size);
 
     // ReadEnvelope is called via Channel::Apply, so no need to call it here.
-    asio::read(*socket_, envelope.buf_seq(), ec);
+    ec = br_.Read(envelope.buf_seq());
     return ec;
   }
 
@@ -336,7 +339,7 @@ auto Channel::ReadEnvelope() -> error_code {
 
   if (is_stream) {
     VLOG(1) << "Processing stream";
-    asio::read(*socket_, env->buf_seq(), ec);
+    ec = br_.Read(env->buf_seq());
     if (!ec) {
       HandleStreamResponse(f.rpc_id);
     }
@@ -351,7 +354,7 @@ auto Channel::ReadEnvelope() -> error_code {
   pending_calls_size_.fetch_sub(1, std::memory_order_relaxed);
   // -- NO interrupt section end
 
-  asio::read(*socket_, env->buf_seq(), ec);
+  ec = br_.Read(env->buf_seq());
   promise.set_value(ec);
 
   return ec;
